@@ -4,6 +4,7 @@ outputs/
 analysis/
 data/
 download/
+runs/
 *.tsv
 *.csv
 
