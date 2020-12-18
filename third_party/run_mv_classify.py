@@ -66,7 +66,6 @@ ALL_MODELS = sum(
 
 MODEL_CLASSES = {
   "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
-  "xlm": (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
   "xlmr": (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
 }
 
@@ -107,8 +106,8 @@ class ConcatDataset(torch.utils.data.Dataset):
 
 def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=None):
   """Train the model."""
-  #if args.local_rank in [-1, 0]:
-  #  tb_writer = SummaryWriter()
+  if args.local_rank in [-1, 0]:
+    tb_writer = SummaryWriter()
 
   args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
@@ -199,17 +198,6 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
   )
   set_seed(args)  # Added here for reproductibility
   for _ in train_iterator:
-    if args.resample_dataset:
-      logger.info("Resample dataset for training....")
-      if args.resample_both_dataset:
-        logger.info("Resample both dataset for training....")
-        train_dataset = load_examples(args, tokenizer, evaluate=False, language=args.train_lang, lang2id=lang2id, bpe_drop=args.bpe_dropout)
-      dropped_train_dataset = load_examples(args, tokenizer, evaluate=False, language=args.train_lang, lang2id=lang2id, bpe_drop=args.bpe_dropout)
-      concat_train_dataset = ConcatDataset(train_dataset, dropped_train_dataset)
-      train_sampler = RandomSampler(concat_train_dataset) if args.local_rank == -1 else DistributedSampler(concat_train_dataset)
-      train_dataloader = DataLoader(concat_train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
-
-
     epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
     for step, concat_batch in enumerate(epoch_iterator):
       # Skip past any already trained steps if resuming training
@@ -221,10 +209,6 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
       batch, dropped_batch = concat_batch
 
       batch = tuple(t.to(args.device) for t in batch)
-      if args.tau > 0:
-          input_ids = utils.switch_out(batch[0], batch[1], args.tau, tokenizer.unk_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.vocab_size)
-      else:
-          input_ids = batch[0]
       inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
       if args.model_type != "distilbert":
         inputs["token_type_ids"] = (
@@ -255,24 +239,14 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
 
       if args.kl_weight > 0:
         prob = torch.nn.functional.softmax(logits/args.kl_t, dim=1)
-        if args.kl_stop_grad:
-          prob = prob.detach()
-        if args.kl_t_scale_both:
-          kl_t = args.kl_t
-        else: 
-          kl_t = 1
-        if args.kl_t_scale_grad:
-          kl_loss_scale = kl_t * args.kl_t
-        else:
-          kl_loss_scale = 1
-        dropped_log_prob = torch.nn.functional.log_softmax(dropped_logits/kl_t, dim=1)
+        dropped_log_prob = torch.nn.functional.log_softmax(dropped_logits, dim=1)
         if len(prob) > len(dropped_log_prob):
           prob = prob[:len(dropped_log_prob)]
         elif len(prob) < len(dropped_log_prob):
           dropped_log_prob = dropped_log_prob[:len(prob)]
         kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
         kl = kl_loss(dropped_log_prob, prob)
-        loss = 0.5*loss + 0.5*dropped_loss + args.kl_weight*kl*kl_loss_scale
+        loss = 0.5*loss + 0.5*dropped_loss + args.kl_weight*kl
       else:
         loss = 0.5*loss + 0.5*dropped_loss
 
@@ -372,8 +346,8 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
       train_iterator.close()
       break
 
-  #if args.local_rank in [-1, 0]:
-  #  tb_writer.close()
+  if args.local_rank in [-1, 0]:
+    tb_writer.close()
 
   return global_step, tr_loss / global_step, best_score, best_checkpoint
 
@@ -793,16 +767,10 @@ def main():
   parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
   parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
   parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
-  parser.add_argument("--tau", type=float, default=-1, help="wait N times of decreasing dev score before early stop during training")
 
   parser.add_argument("--bpe_dropout", default=0, type=float)
   parser.add_argument("--kl_weight", default=0, type=float)
   parser.add_argument("--kl_t", default=1, type=float)
-  parser.add_argument("--kl_t_scale_both", default=0, type=int, help="1 if scale both logits by t")
-  parser.add_argument("--kl_t_scale_grad", default=0, type=int, help="1 if multiply kl loss by t square")
-  parser.add_argument("--kl_stop_grad", default=0, type=int, help="1 if stop gradient to target")
-  parser.add_argument("--resample_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
-  parser.add_argument("--resample_both_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
 
   args = parser.parse_args()
 

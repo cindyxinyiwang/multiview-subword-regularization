@@ -211,16 +211,6 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id)
   set_seed(args)
 
   for _ in train_iterator:
-    if args.resample_dataset:
-      logger.info("Resample dataset for training....")
-      if args.resample_both_dataset:
-        logger.info("Resample both dataset for training....")
-        train_dataset = load_examples(args, tokenizer, evaluate=False, output_examples=False, language=args.train_lang, lang2id=lang2id, bpe_dropout=args.bpe_dropout)
-      dropped_train_dataset = load_examples(args, tokenizer, evaluate=False, output_examples=False, language=args.train_lang, lang2id=lang2id, bpe_dropout=args.bpe_dropout)
-      concat_train_dataset = ConcatDataset(train_dataset, dropped_train_dataset)
-      train_sampler = RandomSampler(concat_train_dataset) if args.local_rank == -1 else DistributedSampler(concat_train_dataset)
-      train_dataloader = DataLoader(concat_train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
-
     epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
     for step, concat_batch in enumerate(epoch_iterator):
 
@@ -279,23 +269,12 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id)
       if args.kl_weight > 0:
         start_prob = torch.nn.functional.softmax(start_logits/args.kl_t, dim=1)
         end_prob = torch.nn.functional.softmax(end_logits/args.kl_t, dim=1)
-        if args.kl_stop_grad:
-          start_prob = start_prob.detach()
-          end_prob = end_prob.detach()
-        if args.kl_t_scale_both:
-          kl_t = args.kl_t
-        else: 
-          kl_t = 1
-        if args.kl_t_scale_grad:
-          kl_loss_scale = kl_t * args.kl_t
-        else:
-          kl_loss_scale = 1
-        dropped_start_log_prob = torch.nn.functional.log_softmax(dropped_start_logits/kl_t, dim=1)
-        dropped_end_log_prob = torch.nn.functional.log_softmax(dropped_end_logits/kl_t, dim=1)
+        dropped_start_log_prob = torch.nn.functional.log_softmax(dropped_start_logits, dim=1)
+        dropped_end_log_prob = torch.nn.functional.log_softmax(dropped_end_logits, dim=1)
         kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
         start_kl = kl_loss(dropped_start_log_prob, start_prob)
         end_kl = kl_loss(dropped_end_log_prob, end_prob)
-        loss = 0.5*loss + 0.5*dropped_loss + args.kl_weight*(start_kl+end_kl)*kl_loss_scale/2
+        loss = 0.5*loss + 0.5*dropped_loss + args.kl_weight*(start_kl+end_kl)/2
       else:
         loss = 0.5*loss + 0.5*dropped_loss
 
@@ -852,12 +831,7 @@ def main():
   parser.add_argument("--bpe_dropout", type=float, default=0, help="wait N times of decreasing dev score before early stop during training")
   parser.add_argument("--kl_weight", default=0, type=float)
   parser.add_argument("--kl_t", default=1, type=float)
-  parser.add_argument("--kl_t_scale_both", default=0, type=int, help="1 if scale both logits by t")
-  parser.add_argument("--kl_t_scale_grad", default=0, type=int, help="1 if multiply kl loss by t square")
-  parser.add_argument("--kl_stop_grad", default=0, type=int, help="1 if stop gradient to target")
 
-  parser.add_argument("--resample_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
-  parser.add_argument("--resample_both_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
   args = parser.parse_args()
 
   if (

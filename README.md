@@ -11,7 +11,7 @@ Our code is based on the [XTREME]() benchmark
 # Download the data
 We simply use the data downloading instruction from the official XTREME repo.
 
-In order to run experiments on XTREME, the first step is to download the dependencies. We assume you have installed [`anaconda`](https://www.anaconda.com/) and use Python 3.7+. The additional requirements including `transformers`, `seqeval` (for sequence labelling evaluation), `tensorboardx`, `jieba`, `kytea`, and `pythainlp` (for text segmentation in Chinese, Japanese, and Thai), and `sacremoses` can be installed by running the following script:
+To install the dependencies:
 ```
 bash install_tools.sh
 ```
@@ -30,29 +30,29 @@ for cross-lingual sentence retrieval.
 For named entity recognition (NER), we use data from the Wikiann (panx) dataset. 
 To fine-tune a pretrained multilingual model on English using Multi-view Subword Regularization:
 ```
-bash mvr_scripts/train_mv_panx.sh
+bash mvr_scripts/train_mvr_panx.sh [MODEL]
 ```
 
 ## PAXS-X sentence classification
 
 For sentence classification, we use the Cross-lingual Paraphrase Adversaries from Word Scrambling (PAWS-X) dataset. You can fine-tune a pre-trained multilingual model on the English PAWS data with the following command:
 ```
-bash scripts/train.sh [MODEL] pawsx
+bash mvr_scripts/train_mvr_pawsx.sh [MODEL]
 ```
 
 ## XNLI sentence classification
 
 The second sentence classification dataset is the Cross-lingual Natural Language Inference (XNLI) dataset. You can fine-tune a pre-trained multilingual model on the English MNLI data with the following command:
 ```
-bash scripts/train.sh [MODEL] xnli
+bash mvr_scripts/train_mvr_xnli.sh [MODEL]
 ```
 
-## XQuAD, MLQA, TyDiQA-GoldP question answering
+## XQuAD, MLQA question answering
 
-For question answering, we use the data from the XQuAD, MLQA, and TyDiQA-Gold Passage datasets.
-For XQuAD and MLQA, the model should be trained on the English SQuAD training set. For TyDiQA-Gold Passage, the model is trained on the English TyDiQA-GoldP training set. Using the following command, you can first fine-tune a pre-trained multilingual model on the corresponding English training data, and then you can obtain predictions on the test data of all tasks.
+For question answering, we use the data from the XQuAD, MLQA Passage datasets.
+For XQuAD and MLQA, the model should be trained on the English SQuAD training set. 
 ```
-bash scripts/train.sh [MODEL] [xquad,mlqa,tydiqa]
+bash mvr_scripts/train_mvr_qa.sh [MODEL]
 ```
 
 # Paper
