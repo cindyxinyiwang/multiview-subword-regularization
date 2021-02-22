@@ -18,7 +18,7 @@ MODEL=${1:-bert-base-multilingual-cased}
 DATA_DIR=${2:-"$REPO/download/"}
 
 TASK='panx'
-MAXL=1
+MAXL=128
 LANGS="ar,he,vi,id,jv,ms,tl,eu,ml,ta,te,af,nl,en,de,el,bn,hi,mr,ur,fa,fr,it,pt,es,bg,ru,ja,ka,ko,th,sw,yo,my,zh,kk,tr,et,fi,hu"
 LC=""
 if [ $MODEL == "bert-base-multilingual-cased" ]; then

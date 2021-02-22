@@ -60,7 +60,7 @@ fi
 DATA_DIR=$DATA_DIR/$TASK/${TASK}_processed_maxlen${MAX_LENGTH}/
 for SEED in 1 2 3 4 5;
 do
-OUTPUT_DIR="$OUT_DIR/$TASK/${MODEL}-LR${LR}-epoch${NUM_EPOCHS}-MaxLen${MAX_LENGTH}_mbped${BPE_DROP}_kl${KL}_klt${KL_T}_kltb${KL_TB}_kltg${KL_TG}_klsg${KL_SG}_s${SEED}/"
+OUTPUT_DIR="$OUT_DIR/$TASK/${MODEL}-LR${LR}-epoch${NUM_EPOCHS}-MaxLen${MAX_LENGTH}_mbped${BPE_DROP}_kl${KL}_klt${KL_T}_s${SEED}/"
 mkdir -p $OUTPUT_DIR
 python $REPO/third_party/run_mv_tag.py \
   --data_dir $DATA_DIR \
@@ -86,8 +86,5 @@ python $REPO/third_party/run_mv_tag.py \
   --bpe_dropout $BPE_DROP \
   --kl_weight $KL \
   --kl_t $KL_T \
-  --kl_t_scale_both $KL_TB \
-  --kl_t_scale_grad $KL_TG \
-  --kl_stop_grad $KL_SG \
   --save_only_best_checkpoint $LC
 done
