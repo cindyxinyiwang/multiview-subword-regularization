@@ -68,7 +68,7 @@ Please cite our paper `\cite{wang2021multiview}`.
 @inproceedings{wang2021multiview,
       author    = {Xinyi Wang and Sebastian Ruder and Graham Neubig},
       title     = {Multi-view Subword Regularization},
-      year      = {2020},
+      year      = {2021},
       booktitle = {NAACL}
 }
 ```
