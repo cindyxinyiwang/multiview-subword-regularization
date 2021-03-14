@@ -65,9 +65,10 @@ bash mvr_scripts/train_mvr_qa.sh [MODEL]
 
 Please cite our paper `\cite{wang2021multiview}`.
 ```
-@article{wang2021multiview,
+@inproceedings{wang2021multiview,
       author    = {Xinyi Wang and Sebastian Ruder and Graham Neubig},
       title     = {Multi-view Subword Regularization},
       year      = {2020},
+      booktitle = {NAACL}
 }
 ```
