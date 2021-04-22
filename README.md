@@ -15,7 +15,7 @@ Multilingual pretrained models uses a single subword segmentation model on data 
 
 
 # Main method implementation
-We implement Multi-view Subword Regularization(MVR) for several different tasks. For example, the main logit of MVR for sequence tagging is [here](https://github.com/cindyxinyiwang/multiview-subword-regularization/blob/main/third_party/run_mv_tag.py#L197). 
+We implement Multi-view Subword Regularization(MVR) for several different tasks. For example, the main logic of MVR for sequence tagging is [here](https://github.com/cindyxinyiwang/multiview-subword-regularization/blob/main/third_party/run_mv_tag.py#L197). 
 
 
 # Download the data
