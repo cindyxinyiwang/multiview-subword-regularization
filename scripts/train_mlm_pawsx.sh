@@ -21,7 +21,7 @@
 
 REPO=$PWD
 MODEL=${1:-bert-base-multilingual-cased}
-GPU=${2:-1}
+GPU=${2:-0}
 DATA_DIR=${3:-"../download/"}
 OUT_DIR=${4:-"$REPO/outputs/"}
 
@@ -31,8 +31,11 @@ TASK='pawsx'
 LR=2e-5
 EPOCH=5
 MAXL=128
-LANGS="de,en,es,fr,ja,ko,zh"
+LANGS="ja,ko,zh,de,en,es,fr"
 BPE_DROP=0
+MLM_P=0.15
+MLM_W=0.1
+
 LC=""
 if [ $MODEL == "bert-base-multilingual-cased" ]; then
   MODEL_TYPE="bert"
@@ -47,24 +50,24 @@ if [ $MODEL == "xlm-mlm-100-1280" ] || [ $MODEL == "xlm-roberta-large" ]; then
   BATCH_SIZE=2
   GRAD_ACC=16
 else
-  BATCH_SIZE=8
-  GRAD_ACC=4
+  BATCH_SIZE=4
+  GRAD_ACC=8
 fi
 
-P=0
 for SEED in 1;
 do
 #SAVE_DIR="${OUT_DIR}/${TASK}/${MODEL}-LR${LR}-epoch${EPOCH}-MaxLen${MAXL}_bped${BPE_DROP}_s${SEED}/"
-SAVE_DIR="${OUT_DIR}/${TASK}/${MODEL}-LR${LR}-epoch${EPOCH}-MaxLen${MAXL}_frommlm_ep10_s${SEED}/"
+SAVE_DIR="${OUT_DIR}/${TASK}/${MODEL}-LR${LR}-epoch${EPOCH}-MaxLen${MAXL}_mlmp${MLM_P}_mlmw${MLM_W}_s${SEED}/"
 mkdir -p $SAVE_DIR
 
-#  --adapt_learning_rate 2e-5 \
-python $PWD/third_party/run_classify.py \
-  --prefix_size $P \
-  --output_prefix "" \
+python $PWD/third_party/run_mlm_classify.py \
   --do_train \
   --do_eval \
-  --init_checkpoint outputs/pawsx/bert-base-multilingual-cased-LR1e-4-epoch10-MaxLen128_seq_mlmp0.15_s1/ \
+  --adapt_learning_rate  0 \
+  --mlm_loss_action "" \
+  --mlm_p $MLM_P \
+  --mlm_w $MLM_W \
+  --output_prefix "" \
   --model_type $MODEL_TYPE \
   --model_name_or_path $MODEL \
   --train_language en \
@@ -87,5 +90,6 @@ python $PWD/third_party/run_classify.py \
   --save_only_best_checkpoint $LC \
   --seed $SEED \
   --bpe_dropout $BPE_DROP \
+  --per_gpu_eval_batch_size 8 \
   --eval_test_set 
 done

@@ -90,6 +90,7 @@ class PretrainedConfig(object):
         self.attention_t = kwargs.pop("attention_t", 1)
         self.fix_class = kwargs.pop("fix_class", False)
 
+        self.prefix_size = kwargs.pop("prefix_size", 0)
         # Additional attributes without default values
         for key, value in kwargs.items():
             try:

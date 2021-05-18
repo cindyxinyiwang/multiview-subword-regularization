@@ -35,6 +35,7 @@ from transformers import (
   AdamW,
   BertConfig,
   BertForSequenceClassification,
+  BertForMLMandSequenceClassification,
   BertTokenizer,
   XLMConfig,
   XLMForSequenceClassification,
@@ -110,13 +111,19 @@ def train(args, train_dataset, model, tokenizer, lang2id=None):
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
   # Prepare optimizer and schedule (linear warmup and decay)
+  trained_params = []
+  for n, p in model.named_parameters():
+      #if "classifier" in n or "prefix" in n:
+      if True:
+          trained_params.append((n, p))
+  #print(trained_params)
   no_decay = ["bias", "LayerNorm.weight"]
   optimizer_grouped_parameters = [
     {
-      "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+      "params": [p for n, p in trained_params if not any(nd in n for nd in no_decay)],
       "weight_decay": args.weight_decay,
     },
-    {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+    {"params": [p for n, p in trained_params if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
   ]
   optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
   scheduler = get_linear_schedule_with_warmup(
@@ -215,6 +222,12 @@ def train(args, train_dataset, model, tokenizer, lang2id=None):
         inputs["langs"] = batch[4]
       outputs = model(**inputs)
       loss = outputs[0]
+
+      if args.adapt_learning_rate > 0:
+        logits = outputs[-1] 
+        entropy = torch.nn.functional.softmax(logits, dim=1)*torch.nn.functional.log_softmax(logits, dim=1)
+        entropy = -entropy.sum() / logits.size(0)
+        loss = loss + entropy
 
       if args.n_gpu > 1:
         loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -316,6 +329,146 @@ def train(args, train_dataset, model, tokenizer, lang2id=None):
   #  tb_writer.close()
 
   return global_step, tr_loss / global_step, best_score, best_checkpoint
+
+
+def evaluate_adapt(args, model, tokenizer, split='train', language='en', lang2id=None, prefix="", output_file=None, label_list=None, output_only_prediction=True):
+  """Evalute the model."""
+  no_decay = ["bias", "LayerNorm.weight"]
+  #no_decay = ["layer.0.output.layer_text_task_adapters"]
+  #filtered = ["classifier"]
+  filtered = []
+  params = []
+  for n, p in model.named_parameters():
+      #if True:
+      if any(nd in n for nd in no_decay) and (not any(f in n for f in filtered)):
+          params.append(p)
+          #print(n)
+  params_copy = [p.clone().detach() for p in params]
+  optimizer_grouped_parameters = [
+    {"params": params, "weight_decay": 0.0}
+    #{"params": [p for n, p in model.named_parameters() if (any(nd in n for nd in no_decay) and (not (any(f in n for f in filtered))))], "weight_decay": 0.0}
+    #{"params": [p for n, p in model.named_parameters()], "weight_decay": 0.0}
+  ]
+  #for n, p in model.named_parameters():
+  #    if any(nd in n for nd in no_decay): print(n)
+  optimizer = AdamW(optimizer_grouped_parameters, lr=args.adapt_learning_rate, eps=args.adam_epsilon)
+
+
+  eval_task_names = (args.task_name,)
+  eval_outputs_dirs = (args.output_dir,)
+
+  results = {}
+  for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
+    eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, split=split, language=language, lang2id=lang2id, evaluate=True)
+
+    if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+      os.makedirs(eval_output_dir)
+
+    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+    # Note that DistributedSampler samples randomly
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+
+    # multi-gpu eval
+    if args.n_gpu > 1:
+      model = torch.nn.DataParallel(model)
+
+    # Eval!
+    logger.info("***** Running evaluation {} {} *****".format(prefix, language))
+    logger.info("  Num examples = %d", len(eval_dataset))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+    eval_loss = 0.0
+    nb_eval_steps = 0
+    preds = None
+    out_label_ids = None
+    sentences = None
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+      batch = tuple(t.to(args.device) for t in batch)
+      #for p, p_orig in zip(params, params_copy):
+      #  p.data.copy_(p_orig.data)
+
+      model.train()
+      inputs = {"input_ids": batch[0],
+            "attention_mask": batch[1],
+            "labels": batch[3]}
+      if args.model_type != "distilbert":
+        # XLM and RoBERTa don"t use segment_ids
+        inputs["token_type_ids"] = batch[2] if args.model_type in ["bert", "xlnet"] else None
+      outputs = model(**inputs)
+      adapt_logits = outputs[-1]
+      
+      # CE loss
+      #adapt_preds = adapt_logits.detach().cpu().numpy()
+      #adapt_preds = np.argmax(adapt_preds, axis=1)
+      #loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
+      #adapt_loss = loss_fct(adapt_logits, torch.LongTensor(adapt_preds).to(args.device))
+      #adapt_loss.backward()
+
+      entropy = torch.nn.functional.softmax(adapt_logits, dim=1)*torch.nn.functional.log_softmax(adapt_logits, dim=1)
+      entropy = -entropy.sum() / adapt_logits.size(0)
+      entropy.backward()
+
+      optimizer.step()
+      optimizer.zero_grad()
+
+
+      model.eval()
+
+      with torch.no_grad():
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+        if args.model_type != "distilbert":
+          inputs["token_type_ids"] = (
+            batch[2] if args.model_type in ["bert"] else None
+          )  # XLM and DistilBERT don't use segment_ids
+        if args.model_type == "xlm":
+          inputs["langs"] = batch[4]
+        outputs = model(**inputs)
+        tmp_eval_loss, logits = outputs[:2]
+
+        eval_loss += tmp_eval_loss.mean().item()
+      nb_eval_steps += 1
+      if preds is None:
+        preds = logits.detach().cpu().numpy()
+        out_label_ids = inputs["labels"].detach().cpu().numpy()
+        sentences = inputs["input_ids"].detach().cpu().numpy()
+      else:
+        preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+        out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+        sentences = np.append(sentences, inputs["input_ids"].detach().cpu().numpy(), axis=0)
+
+    eval_loss = eval_loss / nb_eval_steps
+    if args.output_mode == "classification":
+      preds = np.argmax(preds, axis=1)
+    else:
+      raise ValueError("No other `output_mode` for XNLI.")
+    result = compute_metrics(preds, out_label_ids)
+    results.update(result)
+
+    if output_file:
+      logger.info("***** Save prediction ******")
+      with open(output_file, 'w') as fout:
+        pad_token_id = tokenizer.pad_token_id
+        sentences = sentences.astype(int).tolist()
+        sentences = [[w for w in s if w != pad_token_id]for s in sentences]
+        sentences = [tokenizer.convert_ids_to_tokens(s) for s in sentences]
+        #fout.write('Prediction\tLabel\tSentences\n')
+        for p, l, s in zip(list(preds), list(out_label_ids), sentences):
+          s = ' '.join(s)
+          if label_list:
+            p = label_list[p]
+            l = label_list[l]
+          if output_only_prediction:
+            fout.write(str(p) + '\n')
+          else:
+            fout.write('{}\t{}\t{}\n'.format(p, l, s))
+    logger.info("***** Eval results {} {} *****".format(prefix, language))
+    for key in sorted(result.keys()):
+      logger.info("  %s = %s", args.output_prefix+key, str(result[key]))
+
+  for p, p_orig in zip(params, params_copy):
+    p.data.copy_(p_orig.data)
+
+  return results
 
 
 def evaluate(args, model, tokenizer, split='train', language='en', lang2id=None, prefix="", output_file=None, label_list=None, output_only_prediction=True):
@@ -739,6 +892,10 @@ def main():
   parser.add_argument("--tau", type=float, default=-1, help="wait N times of decreasing dev score before early stop during training")
   parser.add_argument("--bpe_dropout", type=float, default=0, help="wait N times of decreasing dev score before early stop during training")
   parser.add_argument("--resample_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
+
+  parser.add_argument("--adapt_learning_rate", default=0, type=float, help="set to 1 if resample at each epoch")
+  parser.add_argument("--output_prefix", type=str, default="", help="For distant debugging.")
+  parser.add_argument("--prefix_size", type=int, default=0, help="For distant debugging.")
   args = parser.parse_args()
 
   if (
@@ -810,6 +967,7 @@ def main():
     num_labels=num_labels,
     finetuning_task=args.task_name,
     cache_dir=args.cache_dir if args.cache_dir else None,
+    prefix_size=args.prefix_size,
   )
   logger.info("config = {}".format(config))
 
@@ -921,8 +1079,11 @@ def main():
     with open(output_predict_file, 'a') as writer:
       writer.write('======= Predict using the model from {} for {}:\n'.format(best_checkpoint, args.test_split))
       for language in args.predict_languages.split(','):
-        output_file = os.path.join(args.output_dir, 'test-{}.tsv'.format(language))
-        result = evaluate(args, model, tokenizer, split=args.test_split, language=language, lang2id=lang2id, prefix='best_checkpoint', output_file=output_file, label_list=label_list)
+        output_file = os.path.join(args.output_dir, '{}test-{}.tsv'.format(args.output_prefix, language))
+        if args.adapt_learning_rate > 0:
+          result = evaluate_adapt(args, model, tokenizer, split=args.test_split, language=language, lang2id=lang2id, prefix='best_checkpoint', output_file=output_file, label_list=label_list)
+        else:
+          result = evaluate(args, model, tokenizer, split=args.test_split, language=language, lang2id=lang2id, prefix='best_checkpoint', output_file=output_file, label_list=label_list)
         writer.write('{}={}\n'.format(language, result['acc']))
         logger.info('{}={}'.format(language, result['acc']))
         total += result['num']

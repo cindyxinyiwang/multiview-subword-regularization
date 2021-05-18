@@ -147,6 +147,7 @@ if is_torch_available():
         BertForMaskedLM,
         BertForNextSentencePrediction,
         BertForSequenceClassification,
+        BertForMLMandSequenceClassification,
         BertForMultipleChoice,
         BertForTokenClassification,
         BertForMLMandTokenClassification,

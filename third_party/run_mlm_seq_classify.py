@@ -35,6 +35,7 @@ from transformers import (
   AdamW,
   BertConfig,
   BertForSequenceClassification,
+  BertForMLMandSequenceClassification,
   BertTokenizer,
   XLMConfig,
   XLMForSequenceClassification,
@@ -65,7 +66,8 @@ ALL_MODELS = sum(
 )
 
 MODEL_CLASSES = {
-  "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
+  "bert": (BertConfig, BertForMLMandSequenceClassification, BertTokenizer),
+  "xlm": (XLMConfig, XLMForSequenceClassification, XLMTokenizer),
   "xlmr": (XLMRobertaConfig, XLMRobertaForSequenceClassification, XLMRobertaTokenizer),
 }
 
@@ -93,27 +95,14 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
-class ConcatDataset(torch.utils.data.Dataset):
-  def __init__(self, *datasets):
-    self.datasets = datasets
-
-  def __getitem__(self, i):
-    return tuple(d[i] for d in self.datasets)
-
-  def __len__(self):
-    return min(len(d) for d in self.datasets)
-
-
-def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=None):
+def train_mlm(args, train_dataset, model, tokenizer, lang2id=None):
   """Train the model."""
-  if args.local_rank in [-1, 0]:
-    tb_writer = SummaryWriter()
+  #if args.local_rank in [-1, 0]:
+  #  tb_writer = SummaryWriter()
 
   args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-
-  concat_train_dataset = ConcatDataset(train_dataset, dropped_train_dataset)
-  train_sampler = RandomSampler(concat_train_dataset) if args.local_rank == -1 else DistributedSampler(concat_train_dataset)
-  train_dataloader = DataLoader(concat_train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+  train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+  train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
   if args.max_steps > 0:
     t_total = args.max_steps
@@ -122,13 +111,16 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
   # Prepare optimizer and schedule (linear warmup and decay)
+  trained_params = []
+  for n, p in model.named_parameters():
+    trained_params.append((n, p))
   no_decay = ["bias", "LayerNorm.weight"]
   optimizer_grouped_parameters = [
     {
-      "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+      "params": [p for n, p in trained_params if not any(nd in n for nd in no_decay)],
       "weight_decay": args.weight_decay,
     },
-    {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+    {"params": [p for n, p in trained_params if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
   ]
   optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
   scheduler = get_linear_schedule_with_warmup(
@@ -162,7 +154,7 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
 
   # Train!
   logger.info("***** Running training *****")
-  logger.info("  Num examples = %d", len(concat_train_dataset))
+  logger.info("  Num examples = %d", len(train_dataset))
   logger.info("  Num Epochs = %d", args.num_train_epochs)
   logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
   logger.info(
@@ -198,15 +190,185 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
   )
   set_seed(args)  # Added here for reproductibility
   for _ in train_iterator:
+    if args.resample_dataset:
+      logger.info("Resample dataset for training....")
+      train_dataset = load_examples(args, tokenizer, evaluate=False, language=args.train_lang, lang2id=lang2id, bpe_drop=args.bpe_dropout)
+      train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+      train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+
     epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-    for step, concat_batch in enumerate(epoch_iterator):
+    for step, batch in enumerate(epoch_iterator):
       # Skip past any already trained steps if resuming training
       if steps_trained_in_current_epoch > 0:
         steps_trained_in_current_epoch -= 1
         continue
 
       model.train()
-      batch, dropped_batch = concat_batch
+      if args.tau > 0:
+          input_ids = utils.switch_out(batch[0], batch[1], args.tau, tokenizer.unk_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.vocab_size)
+      else:
+          input_ids = batch[0]
+      input_mlm, target_mlm = utils.mask_tokens(input_ids.clone(), tokenizer, mlm_probability=args.mlm_p)
+      mlm_inputs = {"input_ids": input_mlm.to(args.device), "attention_mask": (batch[1]).to(args.device), "masked_lm_labels": target_mlm.to(args.device)}
+      mlm_outputs = model.forward_mlm(**mlm_inputs)
+      mlm_loss = mlm_outputs[0]
+
+      loss = mlm_loss
+      if args.n_gpu > 1:
+        loss = loss.mean()  # mean() to average on multi-gpu parallel training
+      if args.gradient_accumulation_steps > 1:
+        loss = loss / args.gradient_accumulation_steps
+
+      if args.fp16:
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+          scaled_loss.backward()
+      else:
+        loss.backward()
+
+      tr_loss += loss.item()
+      if (step + 1) % args.gradient_accumulation_steps == 0:
+        if args.fp16:
+          torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+        else:
+          torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+        optimizer.step()
+        scheduler.step()  # Update learning rate schedule
+        model.zero_grad()
+        global_step += 1
+
+      if args.max_steps > 0 and global_step > args.max_steps:
+        epoch_iterator.close()
+        break
+    if args.max_steps > 0 and global_step > args.max_steps:
+      train_iterator.close()
+      break
+
+  #if args.local_rank in [-1, 0]:
+  #  tb_writer.close()
+
+  return global_step, tr_loss / global_step, best_score, best_checkpoint
+
+
+def train(args, train_dataset, model, tokenizer, lang2id=None):
+  """Train the model."""
+  #if args.local_rank in [-1, 0]:
+  #  tb_writer = SummaryWriter()
+
+  args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+  train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+  train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+  if args.max_steps > 0:
+    t_total = args.max_steps
+    args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+  else:
+    t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+  # Prepare optimizer and schedule (linear warmup and decay)
+  trained_params = []
+  for n, p in model.named_parameters():
+    trained_params.append((n, p))
+  no_decay = ["bias", "LayerNorm.weight"]
+  optimizer_grouped_parameters = [
+    {
+      "params": [p for n, p in trained_params if not any(nd in n for nd in no_decay)],
+      "weight_decay": args.weight_decay,
+    },
+    {"params": [p for n, p in trained_params if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+  ]
+  optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+  scheduler = get_linear_schedule_with_warmup(
+    optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+  )
+
+  # Check if saved optimizer or scheduler states exist
+  if os.path.isfile(os.path.join(args.model_name_or_path, "optimizer.pt")) and os.path.isfile(
+    os.path.join(args.model_name_or_path, "scheduler.pt")
+  ):
+    # Load in optimizer and scheduler states
+    optimizer.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "optimizer.pt")))
+    scheduler.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "scheduler.pt")))
+
+  if args.fp16:
+    try:
+      from apex import amp
+    except ImportError:
+      raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+
+  # multi-gpu training (should be after apex fp16 initialization)
+  if args.n_gpu > 1:
+    model = torch.nn.DataParallel(model)
+
+  # Distributed training (should be after apex fp16 initialization)
+  if args.local_rank != -1:
+    model = torch.nn.parallel.DistributedDataParallel(
+      model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+    )
+
+  # Train!
+  logger.info("***** Running training *****")
+  logger.info("  Num examples = %d", len(train_dataset))
+  logger.info("  Num Epochs = %d", args.num_train_epochs)
+  logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+  logger.info(
+    "  Total train batch size (w. parallel, distributed & accumulation) = %d",
+    args.train_batch_size
+    * args.gradient_accumulation_steps
+    * (torch.distributed.get_world_size() if args.local_rank != -1 else 1),
+  )
+  logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+  logger.info("  Total optimization steps = %d", t_total)
+
+  global_step = 0
+  epochs_trained = 0
+  steps_trained_in_current_epoch = 0
+  # Check if continuing training from a checkpoint
+  if os.path.exists(args.model_name_or_path):
+    # set global_step to gobal_step of last saved checkpoint from model path
+    global_step = int(args.model_name_or_path.split("-")[-1].split("/")[0])
+    epochs_trained = global_step // (len(train_dataloader) // args.gradient_accumulation_steps)
+    steps_trained_in_current_epoch = global_step % (len(train_dataloader) // args.gradient_accumulation_steps)
+
+    logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+    logger.info("  Continuing training from epoch %d", epochs_trained)
+    logger.info("  Continuing training from global step %d", global_step)
+    logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+
+  best_score = 0
+  best_checkpoint = None
+  tr_loss, logging_loss = 0.0, 0.0
+  model.zero_grad()
+  train_iterator = trange(
+    epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
+  )
+  set_seed(args)  # Added here for reproductibility
+  for _ in train_iterator:
+    if args.resample_dataset:
+      logger.info("Resample dataset for training....")
+      train_dataset = load_examples(args, tokenizer, evaluate=False, language=args.train_lang, lang2id=lang2id, bpe_drop=args.bpe_dropout)
+      train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+      train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+
+
+    epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+    for step, batch in enumerate(epoch_iterator):
+      # Skip past any already trained steps if resuming training
+      if steps_trained_in_current_epoch > 0:
+        steps_trained_in_current_epoch -= 1
+        continue
+
+      model.train()
+      if args.tau > 0:
+          input_ids = utils.switch_out(batch[0], batch[1], args.tau, tokenizer.unk_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.vocab_size)
+      else:
+          input_ids = batch[0]
+      #input_mlm, target_mlm = utils.mask_tokens(input_ids.clone(), tokenizer, mlm_probability=args.mlm_p)
+      #mlm_inputs = {"input_ids": input_mlm.to(args.device), "attention_mask": (batch[1]).to(args.device), "lm_labels": target_mlm.to(args.device)}
+      #mlm_outputs = model.forward_mlm(**mlm_inputs)
+      #mlm_loss = mlm_outputs[0]
 
       batch = tuple(t.to(args.device) for t in batch)
       inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -218,38 +380,8 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
         inputs["langs"] = batch[4]
       outputs = model(**inputs)
       loss = outputs[0]
-      logits = outputs[-1]
 
-      dropped_batch = tuple(t.to(args.device) for t in dropped_batch if t is not None)
-      dropped_inputs = {"input_ids": dropped_batch[0],
-            "attention_mask": dropped_batch[1],
-            "labels": dropped_batch[3]}
-      #      "reduction": "none"}
-
-      if args.model_type != "distilbert":
-        # XLM and RoBERTa don"t use segment_ids
-        dropped_inputs["token_type_ids"] = dropped_batch[2] if args.model_type in ["bert", "xlnet"] else None
-
-      if args.model_type == "xlm":
-        dropped_inputs["langs"] = dropped_batch[4]
-
-      dropped_outputs = model(**dropped_inputs)
-      dropped_loss = dropped_outputs[0]
-      dropped_logits = dropped_outputs[-1]
-
-      if args.kl_weight > 0:
-        prob = torch.nn.functional.softmax(logits/args.kl_t, dim=1)
-        dropped_log_prob = torch.nn.functional.log_softmax(dropped_logits, dim=1)
-        if len(prob) > len(dropped_log_prob):
-          prob = prob[:len(dropped_log_prob)]
-        elif len(prob) < len(dropped_log_prob):
-          dropped_log_prob = dropped_log_prob[:len(prob)]
-        kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
-        kl = kl_loss(dropped_log_prob, prob)
-        loss = 0.5*loss + 0.5*dropped_loss + args.kl_weight*kl
-      else:
-        loss = 0.5*loss + 0.5*dropped_loss
-
+      #loss = loss + args.mlm_w*mlm_loss
       if args.n_gpu > 1:
         loss = loss.mean()  # mean() to average on multi-gpu parallel training
       if args.gradient_accumulation_steps > 1:
@@ -346,22 +478,23 @@ def train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id=
       train_iterator.close()
       break
 
-  if args.local_rank in [-1, 0]:
-    tb_writer.close()
+  #if args.local_rank in [-1, 0]:
+  #  tb_writer.close()
 
   return global_step, tr_loss / global_step, best_score, best_checkpoint
 
 
 def evaluate_adapt(args, model, tokenizer, split='train', language='en', lang2id=None, prefix="", output_file=None, label_list=None, output_only_prediction=True):
   """Evalute the model."""
-  no_decay = ["bias", "LayerNorm.weight"]
+  #no_decay = ["bias", "LayerNorm.weight"]
+  no_decay = ["embedding", "layer.0"]
   #no_decay = ["layer.0.output.layer_text_task_adapters"]
   #filtered = ["classifier"]
   filtered = []
   params = []
   for n, p in model.named_parameters():
-      #if True:
       if any(nd in n for nd in no_decay) and (not any(f in n for f in filtered)):
+      #if True:
           params.append(p)
           #print(n)
   params_copy = [p.clone().detach() for p in params]
@@ -372,8 +505,8 @@ def evaluate_adapt(args, model, tokenizer, split='train', language='en', lang2id
   ]
   #for n, p in model.named_parameters():
   #    if any(nd in n for nd in no_decay): print(n)
+  #optimizer = AdamW(optimizer_grouped_parameters, lr=0, eps=args.adam_epsilon)
   optimizer = AdamW(optimizer_grouped_parameters, lr=args.adapt_learning_rate, eps=args.adam_epsilon)
-
 
   eval_task_names = (args.task_name,)
   eval_outputs_dirs = (args.output_dir,)
@@ -381,16 +514,14 @@ def evaluate_adapt(args, model, tokenizer, split='train', language='en', lang2id
   results = {}
   for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
     eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, split=split, language=language, lang2id=lang2id, evaluate=True)
-    eval_dataset_drop = load_and_cache_examples(args, eval_task, tokenizer, split=split, language=language, lang2id=lang2id, evaluate=True, bpe_drop=args.bpe_dropout)
 
-    concat_dataset = ConcatDataset(eval_dataset, eval_dataset_drop)
     if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
       os.makedirs(eval_output_dir)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(concat_dataset)
-    eval_dataloader = DataLoader(concat_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
     # multi-gpu eval
     if args.n_gpu > 1:
@@ -405,54 +536,44 @@ def evaluate_adapt(args, model, tokenizer, split='train', language='en', lang2id
     preds = None
     out_label_ids = None
     sentences = None
-    for cbatch in tqdm(eval_dataloader, desc="Evaluating"):
-      batch, drop_batch = cbatch
-      batch = tuple(t.to(args.device) for t in batch)
-      drop_batch = tuple(t.to(args.device) for t in drop_batch)
-      #for p, p_orig in zip(params, params_copy):
-      #  p.data.copy_(p_orig.data)
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+      for p, p_orig in zip(params, params_copy):
+        p.data.copy_(p_orig.data)
 
       model.train()
-      inputs = {"input_ids": batch[0],
-            "attention_mask": batch[1],
-            "labels": batch[3]}
-      if args.model_type != "distilbert":
-        # XLM and RoBERTa don"t use segment_ids
-        inputs["token_type_ids"] = batch[2] if args.model_type in ["bert", "xlnet"] else None
-      outputs = model(**inputs)
-      adapt_logits = outputs[-1]
+      input_mlm, target_mlm = utils.mask_tokens(batch[0].clone(), tokenizer, mlm_probability=args.mlm_p)
+      mlm_inputs = {"input_ids": input_mlm.to(args.device), "attention_mask": (batch[1]).to(args.device), "lm_labels": target_mlm.to(args.device)}
+      mlm_outputs = model.forward_mlm(**mlm_inputs)
+      mlm_loss = mlm_outputs[0]
+      mlm_loss = mlm_loss*0.01
+      mlm_loss.backward()
 
-      #drop_inputs = {"input_ids": drop_batch[0],
-      #      "attention_mask": drop_batch[1],
-      #      "labels": drop_batch[3]}
-      #if args.model_type != "distilbert":
-      #  # XLM and RoBERTa don"t use segment_ids
-      #  drop_inputs["token_type_ids"] = drop_batch[2] if args.model_type in ["bert", "xlnet"] else None
-      #drop_outputs = model(**drop_inputs)
-      #drop_adapt_logits = drop_outputs[-1]
-      
       # CE loss
+      #outputs = model(**inputs)
+      #adapt_logits = outputs[-1]
+
       #adapt_preds = adapt_logits.detach().cpu().numpy()
       #adapt_preds = np.argmax(adapt_preds, axis=1)
       #loss_fct = torch.nn.CrossEntropyLoss(reduction="mean")
       #adapt_loss = loss_fct(adapt_logits, torch.LongTensor(adapt_preds).to(args.device))
       #adapt_loss.backward()
 
-      #prob = torch.nn.functional.softmax(adapt_logits, dim=1)
-      #dropped_log_prob = torch.nn.functional.log_softmax(drop_adapt_logits, dim=1)
-      #kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
-      #kl = kl_loss(dropped_log_prob, prob)
-      #kl.backward()
-
-      entropy = torch.nn.functional.softmax(adapt_logits, dim=1)*torch.nn.functional.log_softmax(adapt_logits, dim=1)
-      entropy = -entropy.sum() / adapt_logits.size(0)
-      entropy.backward()
+      #entropy = torch.nn.functional.softmax(adapt_logits, dim=1)*torch.nn.functional.log_softmax(adapt_logits, dim=1)
+      #entropy = -entropy.sum() / adapt_logits.size(0)
+      #entropy.backward()
 
       optimizer.step()
       optimizer.zero_grad()
 
-
       model.eval()
+      batch = tuple(t.to(args.device) for t in batch)
+      inputs = {"input_ids": batch[0],
+            "attention_mask": batch[1],
+            "labels": batch[3]}
+      if args.model_type != "distilbert":
+        # XLM and RoBERTa don"t use segment_ids
+        inputs["token_type_ids"] = batch[2] if args.model_type in ["bert", "xlnet"] else None
+
 
       with torch.no_grad():
         inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -599,7 +720,7 @@ def evaluate(args, model, tokenizer, split='train', language='en', lang2id=None,
   return results
 
 
-def load_and_cache_examples(args, task, tokenizer, split='train', language='en', lang2id=None, evaluate=False, bpe_drop=0):
+def load_and_cache_examples(args, task, tokenizer, split='train', language='en', lang2id=None, evaluate=False):
   # Make sure only the first process in distributed training process the 
   # dataset, and the others will use the cache
   if args.local_rank not in [-1, 0] and not evaluate:
@@ -609,7 +730,9 @@ def load_and_cache_examples(args, task, tokenizer, split='train', language='en',
   output_mode = "classification"
   # Load data features from cache or dataset file
   lc = '_lc' if args.do_lower_case else ''
-  if bpe_drop > 0:
+  bpe_dropout = args.bpe_dropout
+  if split != 'train': bpe_dropout = 0
+  if bpe_dropout > 0:
     cached_features_file = os.path.join(
       args.data_dir,
       "cached_{}_{}_{}_{}_{}{}_drop{}".format(
@@ -619,7 +742,7 @@ def load_and_cache_examples(args, task, tokenizer, split='train', language='en',
         str(task),
         str(language),
         lc,
-        str(bpe_drop),
+        str(bpe_dropout),
       ),
     )
   else:
@@ -663,7 +786,7 @@ def load_and_cache_examples(args, task, tokenizer, split='train', language='en',
       pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
       pad_token_segment_id=0,
       lang2id=lang2id,
-      bpe_dropout=bpe_drop,
+      bpe_dropout=bpe_dropout,
     )
     if args.local_rank in [-1, 0]:
       logger.info("Saving features into cached file %s", cached_features_file)
@@ -689,6 +812,7 @@ def load_and_cache_examples(args, task, tokenizer, split='train', language='en',
   else:  
     dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
   return dataset
+
 
 def load_examples(args, task, tokenizer, split='train', language='en', lang2id=None, evaluate=False, bpe_drop=0):
   # Make sure only the first process in distributed training process the 
@@ -926,14 +1050,16 @@ def main():
   parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
   parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
   parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
-
-  parser.add_argument("--bpe_dropout", default=0, type=float)
-  parser.add_argument("--kl_weight", default=0, type=float)
-  parser.add_argument("--kl_t", default=1, type=float)
+  parser.add_argument("--tau", type=float, default=-1, help="wait N times of decreasing dev score before early stop during training")
+  parser.add_argument("--bpe_dropout", type=float, default=0, help="wait N times of decreasing dev score before early stop during training")
+  parser.add_argument("--resample_dataset", default=0, type=float, help="set to 1 if resample at each epoch")
 
   parser.add_argument("--adapt_learning_rate", default=0, type=float, help="set to 1 if resample at each epoch")
   parser.add_argument("--output_prefix", type=str, default="", help="For distant debugging.")
+  parser.add_argument("--prefix_size", type=int, default=0, help="For distant debugging.")
 
+  parser.add_argument("--mlm_w", type=float, default=1, help="wait N times of decreasing dev score before early stop during training")
+  parser.add_argument("--mlm_p", type=float, default=0.15, help="wait N times of decreasing dev score before early stop during training")
   args = parser.parse_args()
 
   if (
@@ -1005,6 +1131,7 @@ def main():
     num_labels=num_labels,
     finetuning_task=args.task_name,
     cache_dir=args.cache_dir if args.cache_dir else None,
+    prefix_size=args.prefix_size,
   )
   logger.info("config = {}".format(config))
 
@@ -1041,8 +1168,7 @@ def main():
       )
     model.to(args.device)
     train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, split=args.train_split, language=args.train_language, lang2id=lang2id, evaluate=False)
-    dropped_train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, split=args.train_split, language=args.train_language, lang2id=lang2id, bpe_drop=args.bpe_dropout, evaluate=False)
-    global_step, tr_loss, best_score, best_checkpoint = train(args, train_dataset, dropped_train_dataset, model, tokenizer, lang2id)
+    global_step, tr_loss, best_score, best_checkpoint = train_mlm(args, train_dataset, model, tokenizer, lang2id)
     logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
     logger.info(" best checkpoint = {}, best score = {}".format(best_checkpoint, best_score))
 
