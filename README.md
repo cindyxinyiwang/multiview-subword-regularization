@@ -1,6 +1,6 @@
 # Multi-view Subword Regularization 
 
-This repository contains the implementation for [Multi-view Subword Regularization]().
+This repository contains the implementation for [Multi-view Subword Regularization](https://arxiv.org/abs/2103.08490).
 
 ```
 Multi-view Subword Regularization
